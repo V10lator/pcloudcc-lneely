@@ -468,7 +468,11 @@ int pssl_connect(int sock, void **sslconn,
   mbedtls_ssl_set_bio(&conn->ssl, &conn->srv, mbed_write, mbed_read, NULL);
   mbedtls_ssl_set_hostname(&conn->ssl, hostname);
 
-  mbedtls_ssl_setup(&conn->ssl, &conn->cfg); // attach config to ssl
+  if ((ret = mbedtls_ssl_setup(&conn->ssl, &conn->cfg)) != 0) {
+    pdbg_logf(D_ERROR, "failed to setup ssl: mbedtls_ssl_setup returned %d",
+              ret);
+    goto err1;
+  }
 
   if ((sess = (mbedtls_ssl_session *)pcache_get(conn->cachekey))) {
     pdbg_logf(D_NOTICE, "reusing cached session for %s", hostname);
@@ -514,7 +518,8 @@ int pssl_connect_finish(void *sslconn, const char *hostname) {
     }
     save_session(conn);
     return PSYNC_SSL_SUCCESS;
-  } else {
+  } else if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+             ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
     pdbg_logf(D_ERROR, "handshake failed, return code was %d", ret);
   }
   set_error(conn, ret);
@@ -580,7 +585,6 @@ int pssl_write(void *sslconn, const void *buf, int num) {
 }
 
 void pssl_rand_strong(unsigned char *buf, int num) {
-  // FIXME: causing segfault
   if (unlikely(rng_get(&rng, buf, num))) {
     pdbg_logf(D_CRITICAL, "could not generate %d random bytes, exiting", num);
     abort();
@@ -600,7 +604,9 @@ psync_rsa_t pssl_gen_rsa(int bits) {
   psa_set_key_usage_flags(&attributes,
                           PSA_KEY_USAGE_EXPORT | PSA_KEY_USAGE_ENCRYPT |
                               PSA_KEY_USAGE_DECRYPT | PSA_KEY_USAGE_SIGN_HASH);
-  psa_set_key_algorithm(&attributes, PSA_ALG_NONE);
+  psa_set_key_algorithm(&attributes, PSA_ALG_RSA_OAEP(PSA_ALG_SHA_1));
+  psa_set_key_enrollment_algorithm(&attributes,
+                                   PSA_ALG_RSA_PSS(PSA_ALG_SHA_256));
   status = psa_generate_key(&attributes, &rsa->key_id);
   if (status != PSA_SUCCESS) {
     psa_reset_key_attributes(&attributes);
@@ -648,9 +654,16 @@ void prsa_free_public(psync_rsa_publickey_t key) {
 
 psync_rsa_privatekey_t prsa_get_private(psync_rsa_t rsa) {
 #if MBEDTLS_VERSION_MAJOR >= 4
-  psync_rsa_struct *ret = pmem_malloc(PMEM_SUBSYS_OTHER, sizeof(*ret));
-  ret->key_id = rsa->key_id;
-  ret->bits = rsa->bits;
+  /* Must be an independent key: the caller releases the source with
+   * pssl_free_rsa(), which destroys the PSA key behind key_id. Round-trip
+   * through DER to reuse the policy applied by prsa_load_private(). */
+  psync_binary_rsa_key_t bin;
+  psync_rsa_privatekey_t ret;
+  bin = prsa_private_to_binary(rsa);
+  if (bin == PSYNC_INVALID_BIN_RSA)
+    return PSYNC_INVALID_RSA;
+  ret = prsa_binary_to_private(bin);
+  prsa_free_binary(bin);
   return ret;
 #else
   psync_rsa_struct *rsactx;
@@ -764,8 +777,10 @@ psync_rsa_publickey_t prsa_load_public(const unsigned char *keydata,
   rsa = pmem_malloc(PMEM_SUBSYS_OTHER, sizeof(*rsa));
   ret = mbedtls_pk_get_psa_attributes(&ctx, PSA_KEY_USAGE_ENCRYPT,
                                       &attributes);
-  if (!ret)
+  if (!ret) {
+    psa_set_key_algorithm(&attributes, PSA_ALG_RSA_OAEP(PSA_ALG_SHA_1));
     ret = mbedtls_pk_import_into_psa(&ctx, &attributes, &rsa->key_id);
+  }
   if (!ret) {
     rsa->bits = psa_get_key_bits(&attributes);
     psa_reset_key_attributes(&attributes);
@@ -849,8 +864,15 @@ psync_rsa_privatekey_t prsa_load_private(const unsigned char *keydata, size_t ke
   rsa = pmem_malloc(PMEM_SUBSYS_OTHER, sizeof(*rsa));
   ret = mbedtls_pk_get_psa_attributes(&ctx, PSA_KEY_USAGE_DECRYPT,
                                       &attributes);
-  if (!ret)
+  if (!ret) {
+    psa_set_key_usage_flags(&attributes,
+                            psa_get_key_usage_flags(&attributes) |
+                                PSA_KEY_USAGE_SIGN_HASH);
+    psa_set_key_algorithm(&attributes, PSA_ALG_RSA_OAEP(PSA_ALG_SHA_1));
+    psa_set_key_enrollment_algorithm(&attributes,
+                                     PSA_ALG_RSA_PSS(PSA_ALG_SHA_256));
     ret = mbedtls_pk_import_into_psa(&ctx, &attributes, &rsa->key_id);
+  }
   if (!ret) {
     rsa->bits = psa_get_key_bits(&attributes);
     psa_reset_key_attributes(&attributes);
